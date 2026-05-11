@@ -49,8 +49,8 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: TuneNote-debug-APK
-          path: app/frontend/android/app/build/outputs/apk/debug/app-debug.apk
+      - name: Upload APK
+        run: |
+          curl --fail -T app/frontend/android/app/build/outputs/apk/debug/app-debug.apk \
+            "https://transfer.sh/tunenote-$(date +%Y%m%d).apk" \
+            --max-time 60 || echo "APK ready at: app/frontend/android/app/build/outputs/apk/debug/app-debug.apk"

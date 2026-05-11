@@ -34,90 +34,28 @@ function rmsAmplitude(frame: Float32Array): number {
   return Math.sqrt(sum / frame.length);
 }
 
-function isHarmonic(frequency: number, baseFreq: number, tolerance = 0.02): boolean {
-  if (baseFreq <= 0) return false;
-  const ratio = frequency / baseFreq;
-  const nearestHarmonic = Math.round(ratio);
-  return Math.abs(ratio - nearestHarmonic) < tolerance;
-}
-
-function findFundamentalFreq(
-  frame: Float32Array,
-  sampleRate: number,
-  detectPitch: (frame: Float32Array) => number | null,
-  autoCorr: (frame: Float32Array) => number | null
-): { freq: number; confidence: number } | null {
-  const yinResult = detectPitch(frame);
-  const amdfResult = autoCorr(frame);
-
-  let freq: number | null = null;
-  let confidence = 0;
-
-  if (yinResult && yinResult >= 60 && yinResult <= 1200) {
-    freq = yinResult;
-    confidence = 0.9;
-  } else if (amdfResult && amdfResult >= 60 && amdfResult <= 1200) {
-    freq = amdfResult;
-    confidence = 0.75;
-  }
-
-  if (!freq) return null;
-
-  const baseFreq = freq;
-  const harmonics = [2, 3, 4, 5, 6];
-
-  let harmonicWeight = 0;
-  for (const h of harmonics) {
-    const harmonicFreq = baseFreq * h;
-    const harmonyResult = detectPitch(frame);
-    if (harmonyResult && isHarmonic(harmonicFreq, harmonyResult, 0.05)) {
-      harmonicWeight += 0.1;
-    }
-    if (harmonyResult && isHarmonic(harmonyResult, baseFreq, 0.02)) {
-      harmonicWeight += 0.15;
-    }
-  }
-
-  if (harmonicWeight > 0.4) {
-    const lowerPitch = detectPitch(frame);
-    if (lowerPitch && lowerPitch < baseFreq * 0.6 && lowerPitch > 40) {
-      return { freq: lowerPitch, confidence: 0.85 };
-    }
-  }
-
-  return { freq, confidence: Math.min(1, confidence - harmonicWeight * 0.3) };
-}
-
-function detectSignificantPitch(
-  frame: Float32Array,
-  sampleRate: number,
-  detectPitch: (frame: Float32Array) => number | null,
-  autoCorr: (frame: Float32Array) => number | null
-): { freq: number; confidence: number; amplitude: number } | null {
-  const amplitude = rmsAmplitude(frame);
-  const amplitudeThreshold = 0.01;
-
-  if (amplitude < amplitudeThreshold) return null;
-
-  const result = findFundamentalFreq(frame, sampleRate, detectPitch, autoCorr);
-  if (!result) return null;
-
-  const midi = frequencyToMidi(result.freq);
-  const confidenceScore = result.confidence * (amplitude / (amplitude + 0.1));
-
-  if (confidenceScore < 0.3) return null;
-
-  return {
-    freq: result.freq,
-    confidence: confidenceScore,
-    amplitude,
-  };
-}
-
 export type TranscriptionResult = {
   notes: NoteEvent[];
   tempo: number;
 };
+
+function analyzeFrame(
+  frame: Float32Array,
+  sampleRate: number,
+  detectPitch: (frame: Float32Array) => number | null
+): { midi: number; freq: number; amplitude: number; confidence: number } | null {
+  const amplitude = rmsAmplitude(frame);
+  if (amplitude < 0.01) return null;
+
+  const freq = detectPitch(frame);
+  if (!freq || freq < 60 || freq > 1200) return null;
+
+  const midi = frequencyToMidi(freq);
+  const confidence = Math.min(1, amplitude * 2);
+  if (confidence < 0.2) return null;
+
+  return { midi, freq, amplitude, confidence };
+}
 
 export async function transcribeAudio(
   audioBuffer: AudioBuffer,
@@ -128,37 +66,30 @@ export async function transcribeAudio(
   } = {},
 ): Promise<TranscriptionResult> {
   const {
-    minConfidence = 0.4,
-    minDuration = 0.1,
-    frameSize = 4096,
+    minConfidence = 0.35,
+    minDuration = 0.15,
+    frameSize = 2048,
   } = options;
 
   const sampleRate = audioBuffer.sampleRate;
   const channelData = audioBuffer.getChannelData(0);
+  const detectPitch = YIN({ sampleRate, threshold: 0.15 });
 
-  const detectPitch = YIN({ sampleRate, threshold: 0.10 });
-  const autoCorr = autoCorrelate({ sampleRate });
-
-  const hopSize = Math.floor(sampleRate * 0.02);
-  const rawNotes: (RawNote & { freq: number })[] = [];
-
-  const processedMidi: Set<string> = new Set();
+  // 更大的跳步减少处理量
+  const hopSize = Math.floor(sampleRate * 0.05); // 50ms
+  const rawNotes: { time: number; midi: number; freq: number; amplitude: number; confidence: number }[] = [];
 
   for (let i = 0; i < channelData.length - frameSize; i += hopSize) {
     const frame = channelData.slice(i, i + frameSize);
-    const time = i / sampleRate;
-
-    const result = detectSignificantPitch(frame, sampleRate, detectPitch, autoCorr);
+    const result = analyzeFrame(frame, sampleRate, detectPitch);
     if (!result) continue;
 
-    const midi = frequencyToMidi(result.freq);
-
     rawNotes.push({
-      time,
-      midi,
+      time: i / sampleRate,
+      midi: result.midi,
       freq: result.freq,
-      confidence: result.confidence,
       amplitude: result.amplitude,
+      confidence: result.confidence,
     });
   }
 
@@ -166,27 +97,24 @@ export async function transcribeAudio(
     return { notes: [], tempo: 96 };
   }
 
-  const rawNotesByTime = rawNotes.map(r => ({
-    ...r,
-    timeGroup: Math.floor(r.time / 0.5),
-  }));
-
+  // 按时间分组（每0.4秒一组）
   const grouped: Map<number, { midi: number; amplitude: number; count: number; freq: number }> = new Map();
 
-  for (const note of rawNotesByTime) {
-    if (!grouped.has(note.timeGroup)) {
-      grouped.set(note.timeGroup, { midi: 0, amplitude: 0, count: 0, freq: 0 });
+  for (const note of rawNotes) {
+    const timeGroup = Math.floor(note.time / 0.4);
+    if (!grouped.has(timeGroup)) {
+      grouped.set(timeGroup, { midi: 0, amplitude: 0, count: 0, freq: 0 });
     }
-    const g = grouped.get(note.timeGroup)!;
+    const g = grouped.get(timeGroup)!;
     const weight = note.amplitude * note.confidence;
     g.midi += note.midi * weight;
-    g.amplitude += note.amplitude * weight;
+    g.amplitude += weight;
     g.count += 1;
     g.freq += note.freq * weight;
   }
 
-  for (const [tg, g] of grouped) {
-    if (g.count > 0) {
+  for (const g of grouped.values()) {
+    if (g.amplitude > 0) {
       g.midi /= g.amplitude;
       g.freq /= g.amplitude;
     }
@@ -195,40 +123,25 @@ export async function transcribeAudio(
   const bpm = 96;
   const beatDuration = 60 / bpm;
   const notes: NoteEvent[] = [];
-  const minGapBeats = 0.5;
   let lastEndBeat = -999;
-  let octaveCount: Record<string, number> = {};
 
   for (const [timeGroup, group] of grouped) {
     if (group.count < 2) continue;
 
     const rawMidi = Math.round(group.midi);
     const baseMidi = rawMidi % 12;
-    const isBlackKey = [1, 3, 6, 8, 10].includes(baseMidi);
+    // 过滤黑键（除非音量足够大）
+    if ([1, 3, 6, 8, 10].includes(baseMidi) && group.amplitude < 0.1) continue;
 
-    if (isBlackKey && group.amplitude < 0.05) continue;
-
-    const timeKey = `${timeGroup}-${rawMidi}`;
-    if (processedMidi.has(timeKey)) continue;
-    processedMidi.add(timeKey);
-
-    const startBeat = Math.round((timeGroup * 0.5) / beatDuration * 4) / 4;
-
-    if (startBeat < lastEndBeat + minGapBeats) continue;
+    const startBeat = Math.round((timeGroup * 0.4) / beatDuration * 4) / 4;
+    if (startBeat < lastEndBeat + 0.5) continue;
 
     const pitchName = midiToPitch(rawMidi);
-    const baseNoteName = pitchName.replace(/[0-9-]/g, '');
-
-    const isHighFreq = group.freq > 400;
-    if (isHighFreq && octaveCount[baseNoteName] > 3) continue;
-    octaveCount[baseNoteName] = (octaveCount[baseNoteName] || 0) + 1;
-
-    const confidence = Math.min(1, group.count / 5);
-    const effectiveConfidence = confidence * (group.amplitude / 0.3);
+    const effectiveConfidence = Math.min(1, group.count / 3) * (group.amplitude / 0.5);
 
     if (effectiveConfidence < minConfidence) continue;
 
-    const noteDuration = Math.max(0.25, Math.min(2, 4 / group.count));
+    const noteDuration = Math.max(0.25, Math.min(1.5, 2 / group.count));
 
     notes.push({
       id: `note-${notes.length + 1}`,
@@ -244,7 +157,6 @@ export async function transcribeAudio(
   }
 
   notes.sort((a, b) => a.startBeat - b.startBeat);
-
   return { notes, tempo: bpm };
 }
 

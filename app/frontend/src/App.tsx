@@ -39,6 +39,8 @@ function App() {
     setError(null);
   }
 
+  const [progress, setProgress] = useState('');
+
   async function handleTranscribe() {
     if (!audioBlob) {
       setError('请先录音或上传一段音频。');
@@ -47,10 +49,13 @@ function App() {
 
     setIsLoading(true);
     setError(null);
+    setProgress('正在解码音频...');
 
     try {
       const audioBuffer = await audioBufferFromBlob(audioBlob);
-      const result = await transcribeAudio(audioBuffer, { minDuration: 0.08 });
+      setProgress('正在分析旋律...');
+      const result = await transcribeAudio(audioBuffer, { minDuration: 0.15 });
+      setProgress('正在生成乐谱...');
       setScore({
         id: 'realtime_' + Date.now(),
         title: audioName || 'Recording',
@@ -63,6 +68,7 @@ function App() {
       setError(err instanceof Error ? err.message : '识别失败，请稍后重试。');
     } finally {
       setIsLoading(false);
+      setProgress('');
     }
   }
 
@@ -109,6 +115,9 @@ function App() {
           </button>
         </div>
 
+        {isLoading && (
+          <p className="loading-hint">{progress || '识别中...'}</p>
+        )}
         {error && <p className="error">{error}</p>}
       </section>
 

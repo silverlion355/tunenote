@@ -56,11 +56,8 @@ jobs:
           path: app/frontend/android/app/build/outputs/apk/debug/app-debug.apk
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v1
         with:
           files: app/frontend/android/app/build/outputs/apk/debug/app-debug.apk
-          tag: v${{ github.run_number }}
-          name: TuneNote v${{ github.run_number }}
-          draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

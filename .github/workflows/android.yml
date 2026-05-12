@@ -49,22 +49,18 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: TuneNote-debug-APK
           path: app/frontend/android/app/build/outputs/apk/debug/app-debug.apk
 
-      - name: Download APK for upload
-        uses: actions/download-artifact@v4
-        with:
-          name: TuneNote-debug-APK
-          path: ./apk/
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
+        if: success()
         with:
-          files: ./apk/app-debug.apk
-          filename: TuneNote-v13.apk
+          files: app/frontend/android/app/build/outputs/apk/debug/app-debug.apk
+          filename: TuneNote-v14.apk
+          token: ${{ secrets.GITHUB_TOKEN }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

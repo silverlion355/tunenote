@@ -1,3 +1,4 @@
+import { logger, logPitchDetected, logNoteSegment } from './logger';
 import type { NoteEvent } from './types';
 
 export type TranscriptionResult = {
@@ -14,11 +15,8 @@ function midiToPitch(midi: number): string {
 }
 
 function frequencyToMidi(f: number): number {
+  if (f <= 0) return 0;
   return 12 * Math.log2(f / 440) + 69;
-}
-
-function midiToFrequency(midi: number): number {
-  return 440 * Math.pow(2, (midi - 69) / 12);
 }
 
 // Harmonic Product Spectrum for fundamental frequency detection
@@ -73,10 +71,9 @@ function detectPitchHPS(spectrum: Float32Array, sampleRate: number, frameSize: n
 // Autocorrelation with envelope normalization
 function detectPitchAutocorr(frame: Float32Array, sampleRate: number): number | null {
   const n = frame.length;
-  const minPeriod = Math.floor(sampleRate / 1000); // ~1000 Hz max
-  const maxPeriod = Math.floor(sampleRate / 60);  // ~60 Hz min
+  const minPeriod = Math.floor(sampleRate / 1000);
+  const maxPeriod = Math.floor(sampleRate / 60);
 
-  // Compute autocorrelation
   const ac = new Float32Array(maxPeriod);
   for (let lag = minPeriod; lag < maxPeriod; lag++) {
     let sum = 0;
@@ -109,9 +106,9 @@ function detectPitchAutocorr(frame: Float32Array, sampleRate: number): number | 
   return sampleRate / (minPeriod + maxIdx + delta);
 }
 
-// Combined pitch detection using multiple methods
+// Combined pitch detection
 function detectPitch(frame: Float32Array, sampleRate: number): { freq: number; confidence: number } | null {
-  // Method 1: HPS
+  // Compute spectrum for HPS
   const spectrum = new Float32Array(frame.length);
   for (let k = 0; k < frame.length; k++) {
     let re = 0, im = 0;
@@ -124,11 +121,8 @@ function detectPitch(frame: Float32Array, sampleRate: number): { freq: number; c
   }
 
   const hpsFreq = detectPitchHPS(spectrum, sampleRate, frame.length);
-
-  // Method 2: Autocorrelation
   const acFreq = detectPitchAutocorr(frame, sampleRate);
 
-  // Use HPS result if available (more reliable for harmonic sounds)
   if (hpsFreq && hpsFreq >= 60 && hpsFreq <= 1200) {
     return { freq: hpsFreq, confidence: 0.7 };
   }
@@ -149,7 +143,7 @@ function rmsEnergy(frame: Float32Array): number {
   return Math.sqrt(sum / frame.length);
 }
 
-// Apply simple low-pass filter to reduce noise
+// Low-pass filter
 function lowPassFilter(frame: Float32Array, alpha: number = 0.95): Float32Array {
   const filtered = new Float32Array(frame.length);
   let prev = 0;
@@ -176,30 +170,31 @@ export async function transcribeAudio(
   const sampleRate = audioBuffer.sampleRate;
   const channelData = audioBuffer.getChannelData(0);
 
-  // Use ~46ms window for good frequency resolution
   const frameSize = Math.floor(sampleRate * 0.046);
-  // 10ms hop for better time resolution
   const hopSize = Math.floor(sampleRate * 0.01);
 
+  logger.info('Transcription', `开始分析音频: 采样率=${sampleRate}Hz, 帧大小=${frameSize}, 跳步=${hopSize}`);
+
   const rawPitches: { time: number; freq: number; midi: number; energy: number; confidence: number }[] = [];
+  let frameCount = 0;
+  let pitchDetectedCount = 0;
 
   for (let i = 0; i < channelData.length - frameSize; i += hopSize) {
+    frameCount++;
     const frame = new Float32Array(frameSize);
     for (let j = 0; j < frameSize; j++) {
       frame[j] = channelData[i + j];
     }
 
-    // Apply slight low-pass filter
     const filtered = lowPassFilter(frame);
-
     const energy = rmsEnergy(filtered);
 
-    // Very sensitive threshold
     if (energy < 0.002) continue;
 
     const pitchResult = detectPitch(filtered, sampleRate);
     if (!pitchResult) continue;
 
+    pitchDetectedCount++;
     const midi = frequencyToMidi(pitchResult.freq);
     rawPitches.push({
       time: i / sampleRate,
@@ -208,31 +203,34 @@ export async function transcribeAudio(
       energy,
       confidence: pitchResult.confidence,
     });
+
+    // Log every 10th detection for debugging
+    if (pitchDetectedCount % 10 === 0) {
+      logPitchDetected(Math.round(midi), pitchResult.freq, i / sampleRate);
+    }
   }
 
+  logger.info('Transcription', `帧分析完成: 共${frameCount}帧, 检测到${pitchDetectedCount}个音高`);
+
   if (rawPitches.length === 0) {
+    logger.warn('Transcription', '未检测到任何音高');
     return { notes: [], tempo: 96, key: 'C' };
   }
 
-  // ========== Advanced Note Tracking ==========
-
   // Group pitches into note segments
   const segments: { start: number; end: number; midi: number; energy: number; count: number }[] = [];
-
   let currentSeg: (typeof segments)[0] | null = null;
 
   for (const pitch of rawPitches) {
     if (!currentSeg) {
       currentSeg = { start: pitch.time, end: pitch.time, midi: pitch.midi, energy: pitch.energy, count: 1 };
     } else if (Math.abs(Math.round(pitch.midi) - Math.round(currentSeg.midi)) <= 1 && pitch.time - currentSeg.end < 0.2) {
-      // Continue current segment
       currentSeg.end = pitch.time;
       currentSeg.midi = (currentSeg.midi * currentSeg.count + pitch.midi) / (currentSeg.count + 1);
       currentSeg.energy = (currentSeg.energy * currentSeg.count + pitch.energy) / (currentSeg.count + 1);
       currentSeg.count++;
     } else {
-      // Save and start new segment
-      if (currentSeg.count >= 3) {  // Minimum 3 frames for a valid note
+      if (currentSeg.count >= 3) {
         segments.push(currentSeg);
       }
       currentSeg = { start: pitch.time, end: pitch.time, midi: pitch.midi, energy: pitch.energy, count: 1 };
@@ -243,40 +241,37 @@ export async function transcribeAudio(
     segments.push(currentSeg);
   }
 
-  // Filter out very short segments
+  logger.info('Transcription', `音符分段完成: ${segments.length}个段落`);
+
   const validSegments = segments.filter(seg => seg.end - seg.start >= minDuration);
 
   if (validSegments.length === 0) {
+    logger.warn('Transcription', '没有有效的音符段落');
     return { notes: [], tempo: 96, key: 'C' };
   }
 
-  // Quantize to musical beats
   const bpm = 96;
   const beatSec = 60 / bpm;
-
   const notes: NoteEvent[] = [];
 
   for (const seg of validSegments) {
     const duration = seg.end - seg.start;
 
-    // Calculate start and duration in beats
     let startBeat = seg.start / beatSec;
     let durationBeat = duration / beatSec;
 
-    // Quantize to nearest 1/8 beat
     startBeat = Math.round(startBeat * 8) / 8;
     durationBeat = Math.max(0.25, Math.round(durationBeat * 4) / 4);
 
     const roundedMidi = Math.round(seg.midi);
 
-    // Skip if too low or too high
     if (roundedMidi < 36 || roundedMidi > 84) continue;
 
     const confidence = Math.min(1, seg.energy * 2) * Math.min(1, seg.count / 5);
 
     if (confidence < minConfidence) continue;
 
-    notes.push({
+    const note: NoteEvent = {
       id: `note-${notes.length + 1}`,
       midi: roundedMidi,
       pitch: midiToPitch(roundedMidi),
@@ -284,12 +279,15 @@ export async function transcribeAudio(
       durationBeat,
       velocity: 75 + Math.round(confidence * 20),
       confidence,
-    });
+    };
+
+    notes.push(note);
+    logNoteSegment(startBeat, roundedMidi, durationBeat);
   }
 
   notes.sort((a, b) => a.startBeat - b.startBeat);
 
-  // Merge very close notes of same pitch
+  // Merge very close notes
   const mergedNotes: NoteEvent[] = [];
   for (const note of notes) {
     const last = mergedNotes[mergedNotes.length - 1];
@@ -299,6 +297,8 @@ export async function transcribeAudio(
       mergedNotes.push({ ...note });
     }
   }
+
+  logger.info('Transcription', `最终音符数量: ${mergedNotes.length}`);
 
   return { notes: mergedNotes, tempo: bpm, key: 'C' };
 }

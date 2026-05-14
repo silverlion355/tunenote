@@ -3,6 +3,8 @@ import { transcribeAudio, audioBufferFromBlob } from './transcription';
 import { playScore } from './audio';
 import { Recorder } from './components/Recorder';
 import { ScorePreview } from './components/ScorePreview';
+import { LogViewer } from './components/LogViewer';
+import { logger, logAudioLoaded, logTranscriptionStart, logTranscriptionStep, logTranscriptionComplete, logTranscriptionError, logPlaybackStart, logAppError } from './logger';
 import type { ScoreDraft } from './types';
 
 function App() {
@@ -30,6 +32,7 @@ function App() {
     setAudioName(file.name);
     setScore(null);
     setError(null);
+    logger.info('Audio', `用户选择文件: ${file.name}`, { size: file.size, type: file.type });
   }
 
   function handleAudioReady(blob: Blob, filename: string) {
@@ -37,6 +40,7 @@ function App() {
     setAudioName(filename);
     setScore(null);
     setError(null);
+    logger.info('Audio', `录音完成: ${filename}`, { size: blob.size });
   }
 
   const [progress, setProgress] = useState('');
@@ -44,31 +48,57 @@ function App() {
   async function handleTranscribe() {
     if (!audioBlob) {
       setError('请先录音或上传一段音频。');
+      logger.warn('Transcription', '尝试识别但没有音频');
       return;
     }
 
     setIsLoading(true);
     setError(null);
-    setProgress('正在解码音频...');
+    logTranscriptionStart();
 
     try {
+      setProgress('正在解码音频...');
+      logTranscriptionStep('解码音频');
       const audioBuffer = await audioBufferFromBlob(audioBlob);
-      setProgress('正在分析旋律（YIN+AMDF双重检测）...');
+      logAudioLoaded(audioName || 'recording', audioBlob.size, audioBuffer.duration);
+
+      setProgress('正在分析旋律（HPS+自相关检测）...');
+      logTranscriptionStep('HPS+自相关检测');
       const result = await transcribeAudio(audioBuffer, { minDuration: 0.1, minConfidence: 0.25 });
+
       setProgress('正在生成乐谱...');
-      setScore({
+      logTranscriptionStep('生成乐谱');
+
+      const newScore: ScoreDraft = {
         id: 'realtime_' + Date.now(),
         title: audioName || 'Recording',
         tempo: result.tempo,
         timeSignature: '4/4',
         key: result.key,
         notes: result.notes,
-      });
+      };
+
+      setScore(newScore);
+      logTranscriptionComplete(result.notes.length, result.tempo, result.key);
+
+      if (result.notes.length === 0) {
+        logger.warn('Transcription', '未检测到任何音符');
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : '识别失败，请稍后重试。');
+      const message = err instanceof Error ? err.message : '识别失败，请稍后重试。';
+      setError(message);
+      logTranscriptionError(message);
+      logAppError('transcribe', err as Error);
     } finally {
       setIsLoading(false);
       setProgress('');
+    }
+  }
+
+  function handlePlayScore() {
+    if (score) {
+      logPlaybackStart(score.notes.length);
+      playScore(score);
     }
   }
 
@@ -110,7 +140,7 @@ function App() {
           <button onClick={handleTranscribe} disabled={isLoading || !audioBlob}>
             {isLoading ? '识别中…' : '开始识别'}
           </button>
-          <button onClick={() => score && playScore(score)} disabled={!score} className="secondary">
+          <button onClick={handlePlayScore} disabled={!score} className="secondary">
             播放生成旋律
           </button>
         </div>
@@ -122,6 +152,8 @@ function App() {
       </section>
 
       {score && <ScorePreview score={score} />}
+
+      <LogViewer />
     </main>
   );
 }

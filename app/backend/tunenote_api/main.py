@@ -1,7 +1,8 @@
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from .mock_transcription import create_mock_score
+from .transcription import transcribe_audio
 from .models import TranscriptionResponse
 
 app = FastAPI(title="TuneNote API", version="0.1.0")
@@ -27,14 +28,29 @@ async def transcribe(
     timeSignature: str = Form("4/4"),
     key: str = Form("C"),
 ) -> TranscriptionResponse:
-    await audio.read()
-    score = create_mock_score(
-        title=audio.filename or "Mock Melody",
-        tempo=tempo,
-        time_signature=timeSignature,
-        key=key,
-    )
-    return TranscriptionResponse(
-        score=score,
-        warnings=["This MVP currently returns a mock melody; real audio transcription is not connected yet."],
-    )
+    """Transcribe audio file to music notation using Basic Pitch."""
+    # Read audio data
+    audio_data = await audio.read()
+
+    if len(audio_data) == 0:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+
+    # Check file size (max 50MB)
+    if len(audio_data) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Audio file too large (max 50MB)")
+
+    try:
+        score, warnings = transcribe_audio(
+            audio_data,
+            title=audio.filename or "Recorded Melody",
+            tempo=tempo,
+            time_signature=timeSignature,
+            key=key,
+        )
+
+        return TranscriptionResponse(
+            score=score,
+            warnings=warnings,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")

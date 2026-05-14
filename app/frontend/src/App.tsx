@@ -53,15 +53,15 @@ function App() {
 
     try {
       const audioBuffer = await audioBufferFromBlob(audioBlob);
-      setProgress('正在分析旋律...');
-      const result = await transcribeAudio(audioBuffer, { minDuration: 0.15 });
+      setProgress('正在分析旋律（YIN+AMDF双重检测）...');
+      const result = await transcribeAudio(audioBuffer, { minDuration: 0.1, minConfidence: 0.25 });
       setProgress('正在生成乐谱...');
       setScore({
         id: 'realtime_' + Date.now(),
         title: audioName || 'Recording',
         tempo: result.tempo,
         timeSignature: '4/4',
-        key: 'C',
+        key: result.key,
         notes: result.notes,
       });
     } catch (err) {

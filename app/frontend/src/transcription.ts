@@ -1,20 +1,10 @@
-import * as Pitchfinder from 'pitchfinder';
 import type { NoteEvent } from './types';
 
-const YIN = Pitchfinder.YIN;
-const AMDF = Pitchfinder.AMDF;
-
-interface RawNote {
-  time: number;
-  midi: number;
-  confidence: number;
-  amplitude: number;
-}
-
-function frequencyToMidi(frequency: number): number {
-  if (frequency <= 0) return 0;
-  return 12 * Math.log2(frequency / 440) + 69;
-}
+export type TranscriptionResult = {
+  notes: NoteEvent[];
+  tempo: number;
+  key: string;
+};
 
 function midiToPitch(midi: number): string {
   const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -23,7 +13,135 @@ function midiToPitch(midi: number): string {
   return `${noteName}${octave}`;
 }
 
-function rmsAmplitude(frame: Float32Array): number {
+function frequencyToMidi(f: number): number {
+  return 12 * Math.log2(f / 440) + 69;
+}
+
+function midiToFrequency(midi: number): number {
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+// Harmonic Product Spectrum for fundamental frequency detection
+function detectPitchHPS(spectrum: Float32Array, sampleRate: number, frameSize: number): number | null {
+  const minFreq = 80;
+  const maxFreq = 1000;
+
+  const minBin = Math.floor(minFreq * frameSize / sampleRate);
+  const maxBin = Math.floor(maxFreq * frameSize / sampleRate);
+
+  // Harmonic Product Spectrum
+  const hpsLength = maxBin - minBin + 1;
+  const hps = new Float32Array(hpsLength);
+
+  for (let i = 0; i < hpsLength; i++) {
+    hps[i] = Math.abs(spectrum[minBin + i]);
+  }
+
+  // Downsample harmonics
+  for (let h = 2; h <= 5; h++) {
+    for (let i = 0; i < hpsLength; i++) {
+      const bin = minBin + Math.floor(i * h);
+      if (bin < minBin + spectrum.length) {
+        hps[i] *= Math.abs(spectrum[bin]);
+      }
+    }
+  }
+
+  // Find peak in HPS
+  let maxVal = 0;
+  let maxIdx = 0;
+  for (let i = 0; i < hpsLength; i++) {
+    if (hps[i] > maxVal) {
+      maxVal = hps[i];
+      maxIdx = i;
+    }
+  }
+
+  if (maxVal < 0.01) return null;
+
+  // Parabolic interpolation for better accuracy
+  const x1 = maxIdx > 0 ? hps[maxIdx - 1] : 0;
+  const x2 = hps[maxIdx];
+  const x3 = maxIdx < hpsLength - 1 ? hps[maxIdx + 1] : 0;
+
+  const delta = 0.5 * (x1 - x3) / (x1 - 2 * x2 + x3);
+  const peakBin = minBin + maxIdx + delta;
+
+  return peakBin * sampleRate / frameSize;
+}
+
+// Autocorrelation with envelope normalization
+function detectPitchAutocorr(frame: Float32Array, sampleRate: number): number | null {
+  const n = frame.length;
+  const minPeriod = Math.floor(sampleRate / 1000); // ~1000 Hz max
+  const maxPeriod = Math.floor(sampleRate / 60);  // ~60 Hz min
+
+  // Compute autocorrelation
+  const ac = new Float32Array(maxPeriod);
+  for (let lag = minPeriod; lag < maxPeriod; lag++) {
+    let sum = 0;
+    let norm = 0;
+    for (let i = 0; i < n - lag; i++) {
+      sum += frame[i] * frame[i + lag];
+      norm += frame[i] * frame[i] + frame[i + lag] * frame[i + lag];
+    }
+    ac[lag - minPeriod] = sum / (norm / 2 + 0.0001);
+  }
+
+  // Find first peak after minimum period
+  let maxVal = 0;
+  let maxIdx = 0;
+  for (let i = 10; i < ac.length - 1; i++) {
+    if (ac[i] > ac[i - 1] && ac[i] > ac[i + 1] && ac[i] > maxVal) {
+      maxVal = ac[i];
+      maxIdx = i;
+    }
+  }
+
+  if (maxVal < 0.2) return null;
+
+  // Parabolic interpolation
+  const y1 = ac[maxIdx - 1] || 0;
+  const y2 = ac[maxIdx];
+  const y3 = ac[maxIdx + 1] || 0;
+  const delta = 0.5 * (y1 - y3) / (y1 - 2 * y2 + y3);
+
+  return sampleRate / (minPeriod + maxIdx + delta);
+}
+
+// Combined pitch detection using multiple methods
+function detectPitch(frame: Float32Array, sampleRate: number): { freq: number; confidence: number } | null {
+  // Method 1: HPS
+  const spectrum = new Float32Array(frame.length);
+  for (let k = 0; k < frame.length; k++) {
+    let re = 0, im = 0;
+    for (let n = 0; n < frame.length; n++) {
+      const angle = -2 * Math.PI * k * n / frame.length;
+      re += frame[n] * Math.cos(angle);
+      im += frame[n] * Math.sin(angle);
+    }
+    spectrum[k] = Math.sqrt(re * re + im * im) / frame.length;
+  }
+
+  const hpsFreq = detectPitchHPS(spectrum, sampleRate, frame.length);
+
+  // Method 2: Autocorrelation
+  const acFreq = detectPitchAutocorr(frame, sampleRate);
+
+  // Use HPS result if available (more reliable for harmonic sounds)
+  if (hpsFreq && hpsFreq >= 60 && hpsFreq <= 1200) {
+    return { freq: hpsFreq, confidence: 0.7 };
+  }
+
+  if (acFreq && acFreq >= 60 && acFreq <= 1200) {
+    return { freq: acFreq, confidence: 0.5 };
+  }
+
+  return null;
+}
+
+// Calculate RMS energy
+function rmsEnergy(frame: Float32Array): number {
   let sum = 0;
   for (let i = 0; i < frame.length; i++) {
     sum += frame[i] * frame[i];
@@ -31,34 +149,15 @@ function rmsAmplitude(frame: Float32Array): number {
   return Math.sqrt(sum / frame.length);
 }
 
-export type TranscriptionResult = {
-  notes: NoteEvent[];
-  tempo: number;
-  key: string;
-};
-
-function analyzeFrame(
-  frame: Float32Array,
-  sampleRate: number,
-  yin: (f: Float32Array) => number | null,
-  amdf: (f: Float32Array) => number | null,
-): { midi: number; freq: number; amplitude: number; confidence: number } | null {
-  const amplitude = rmsAmplitude(frame);
-  if (amplitude < 0.005) return null; // 更低的阈值，更敏感
-
-  // 尝试YIN，如果失败尝试AMDF
-  let freq = yin(frame);
-  if (!freq || freq < 50 || freq > 1500) {
-    freq = amdf(frame);
+// Apply simple low-pass filter to reduce noise
+function lowPassFilter(frame: Float32Array, alpha: number = 0.95): Float32Array {
+  const filtered = new Float32Array(frame.length);
+  let prev = 0;
+  for (let i = 0; i < frame.length; i++) {
+    filtered[i] = alpha * frame[i] + (1 - alpha) * prev;
+    prev = filtered[i];
   }
-  if (!freq || freq < 50 || freq > 1500) return null;
-
-  const midi = frequencyToMidi(freq);
-  // 置信度基于振幅和YIN确定性
-  const confidence = Math.min(1, amplitude * 3);
-  if (confidence < 0.15) return null;
-
-  return { midi, freq, amplitude, confidence };
+  return filtered;
 }
 
 export async function transcribeAudio(
@@ -66,131 +165,142 @@ export async function transcribeAudio(
   options: {
     minConfidence?: number;
     minDuration?: number;
-    frameSize?: number;
-    minAmplitude?: number;
+    useServer?: boolean;
   } = {},
 ): Promise<TranscriptionResult> {
   const {
-    minConfidence = 0.25,
-    minDuration = 0.1,
-    frameSize = 4096,
-    minAmplitude = 0.005,
+    minConfidence = 0.15,
+    minDuration = 0.08,
   } = options;
 
   const sampleRate = audioBuffer.sampleRate;
   const channelData = audioBuffer.getChannelData(0);
-  const yin = YIN({ sampleRate, threshold: 0.10 }); // 更低的阈值
-  const amdf = AMDF({ sampleRate, minFrequency: 50, maxFrequency: 1500 });
 
-  // 25ms 跳步 - 更密集的分析
-  const hopSize = Math.floor(sampleRate * 0.025);
-  const rawNotes: RawNote[] = [];
+  // Use ~46ms window for good frequency resolution
+  const frameSize = Math.floor(sampleRate * 0.046);
+  // 10ms hop for better time resolution
+  const hopSize = Math.floor(sampleRate * 0.01);
+
+  const rawPitches: { time: number; freq: number; midi: number; energy: number; confidence: number }[] = [];
 
   for (let i = 0; i < channelData.length - frameSize; i += hopSize) {
-    const frame = channelData.slice(i, i + frameSize);
-    const result = analyzeFrame(frame, sampleRate, yin, amdf);
-    if (!result) continue;
+    const frame = new Float32Array(frameSize);
+    for (let j = 0; j < frameSize; j++) {
+      frame[j] = channelData[i + j];
+    }
 
-    rawNotes.push({
+    // Apply slight low-pass filter
+    const filtered = lowPassFilter(frame);
+
+    const energy = rmsEnergy(filtered);
+
+    // Very sensitive threshold
+    if (energy < 0.002) continue;
+
+    const pitchResult = detectPitch(filtered, sampleRate);
+    if (!pitchResult) continue;
+
+    const midi = frequencyToMidi(pitchResult.freq);
+    rawPitches.push({
       time: i / sampleRate,
-      midi: result.midi,
-      amplitude: result.amplitude,
-      confidence: result.confidence,
+      freq: pitchResult.freq,
+      midi,
+      energy,
+      confidence: pitchResult.confidence,
     });
   }
 
-  if (rawNotes.length === 0) {
+  if (rawPitches.length === 0) {
     return { notes: [], tempo: 96, key: 'C' };
   }
 
-  // === 步骤1：按时间分组，合并相邻检测 ===
-  const timeResolution = 0.1; // 100ms时间窗口
-  const grouped: Map<number, { midi: number; amplitude: number; count: number }> = new Map();
+  // ========== Advanced Note Tracking ==========
 
-  for (const note of rawNotes) {
-    const timeGroup = Math.round(note.time / timeResolution);
-    if (!grouped.has(timeGroup)) {
-      grouped.set(timeGroup, { midi: 0, amplitude: 0, count: 0 });
-    }
-    const g = grouped.get(timeGroup)!;
-    const weight = note.amplitude * note.confidence;
-    g.midi += note.midi * weight;
-    g.amplitude += weight;
-    g.count += 1;
-  }
+  // Group pitches into note segments
+  const segments: { start: number; end: number; midi: number; energy: number; count: number }[] = [];
 
-  for (const g of grouped.values()) {
-    if (g.amplitude > 0) {
-      g.midi /= g.amplitude;
-    }
-  }
+  let currentSeg: (typeof segments)[0] | null = null;
 
-  // === 步骤2：合并连续的相同音高片段 ===
-  const segments: { startTime: number; endTime: number; midi: number; avgAmplitude: number; count: number }[] = [];
-  let currentSegment: typeof segments[0] | null = null;
-
-  const sortedGroups = Array.from(grouped.entries()).sort((a, b) => a[0] - b[0]);
-
-  for (const [timeKey, group] of sortedGroups) {
-    const time = timeKey * timeResolution;
-    const roundedMidi = Math.round(group.midi);
-
-    if (!currentSegment) {
-      currentSegment = { startTime: time, endTime: time, midi: roundedMidi, avgAmplitude: group.amplitude, count: group.count };
-    } else if (Math.abs(roundedMidi - currentSegment.midi) <= 1 && time - currentSegment.endTime < 0.25) {
-      // 继续当前片段
-      currentSegment.endTime = time;
-      currentSegment.avgAmplitude = (currentSegment.avgAmplitude * currentSegment.count + group.amplitude) / (currentSegment.count + 1);
-      currentSegment.count += group.count;
+  for (const pitch of rawPitches) {
+    if (!currentSeg) {
+      currentSeg = { start: pitch.time, end: pitch.time, midi: pitch.midi, energy: pitch.energy, count: 1 };
+    } else if (Math.abs(Math.round(pitch.midi) - Math.round(currentSeg.midi)) <= 1 && pitch.time - currentSeg.end < 0.2) {
+      // Continue current segment
+      currentSeg.end = pitch.time;
+      currentSeg.midi = (currentSeg.midi * currentSeg.count + pitch.midi) / (currentSeg.count + 1);
+      currentSeg.energy = (currentSeg.energy * currentSeg.count + pitch.energy) / (currentSeg.count + 1);
+      currentSeg.count++;
     } else {
-      // 保存当前片段，开始新片段
-      segments.push(currentSegment);
-      currentSegment = { startTime: time, endTime: time, midi: roundedMidi, avgAmplitude: group.amplitude, count: group.count };
+      // Save and start new segment
+      if (currentSeg.count >= 3) {  // Minimum 3 frames for a valid note
+        segments.push(currentSeg);
+      }
+      currentSeg = { start: pitch.time, end: pitch.time, midi: pitch.midi, energy: pitch.energy, count: 1 };
     }
   }
-  if (currentSegment) {
-    segments.push(currentSegment);
+
+  if (currentSeg && currentSeg.count >= 3) {
+    segments.push(currentSeg);
   }
 
-  // === 步骤3：量化到节拍网格 ===
+  // Filter out very short segments
+  const validSegments = segments.filter(seg => seg.end - seg.start >= minDuration);
+
+  if (validSegments.length === 0) {
+    return { notes: [], tempo: 96, key: 'C' };
+  }
+
+  // Quantize to musical beats
   const bpm = 96;
-  const beatDuration = 60 / bpm;
+  const beatSec = 60 / bpm;
+
   const notes: NoteEvent[] = [];
-  let lastEndBeat = -999;
 
-  for (const seg of segments) {
-    const startBeat = Math.round((seg.startTime) / beatDuration * 4) / 4;
-    const endBeat = Math.round((seg.endTime) / beatDuration * 4) / 4;
-    const durationBeat = Math.max(0.25, endBeat - startBeat);
+  for (const seg of validSegments) {
+    const duration = seg.end - seg.start;
 
-    // 跳过与上一个音符重叠的
-    if (startBeat < lastEndBeat) continue;
+    // Calculate start and duration in beats
+    let startBeat = seg.start / beatSec;
+    let durationBeat = duration / beatSec;
 
-    const rawMidi = seg.midi;
-    const pitchName = midiToPitch(rawMidi);
-    const effectiveConfidence = Math.min(1, seg.count / 5) * Math.min(1, seg.avgAmplitude * 2);
+    // Quantize to nearest 1/8 beat
+    startBeat = Math.round(startBeat * 8) / 8;
+    durationBeat = Math.max(0.25, Math.round(durationBeat * 4) / 4);
 
-    if (effectiveConfidence < minConfidence) continue;
+    const roundedMidi = Math.round(seg.midi);
+
+    // Skip if too low or too high
+    if (roundedMidi < 36 || roundedMidi > 84) continue;
+
+    const confidence = Math.min(1, seg.energy * 2) * Math.min(1, seg.count / 5);
+
+    if (confidence < minConfidence) continue;
 
     notes.push({
       id: `note-${notes.length + 1}`,
-      midi: rawMidi,
-      pitch: pitchName,
+      midi: roundedMidi,
+      pitch: midiToPitch(roundedMidi),
       startBeat,
       durationBeat,
-      velocity: 80,
-      confidence: effectiveConfidence,
+      velocity: 75 + Math.round(confidence * 20),
+      confidence,
     });
-
-    lastEndBeat = startBeat + durationBeat;
   }
 
   notes.sort((a, b) => a.startBeat - b.startBeat);
 
-  // === 步骤4：简单调性估计 ===
-  const key = 'C'; // 简化版，后续可以添加调性检测
+  // Merge very close notes of same pitch
+  const mergedNotes: NoteEvent[] = [];
+  for (const note of notes) {
+    const last = mergedNotes[mergedNotes.length - 1];
+    if (last && last.midi === note.midi && note.startBeat - (last.startBeat + last.durationBeat) < 0.25) {
+      last.durationBeat = note.startBeat + note.durationBeat - last.startBeat;
+    } else {
+      mergedNotes.push({ ...note });
+    }
+  }
 
-  return { notes, tempo: bpm, key };
+  return { notes: mergedNotes, tempo: bpm, key: 'C' };
 }
 
 export function audioBufferFromBlob(blob: Blob): Promise<AudioBuffer> {
@@ -199,8 +309,7 @@ export function audioBufferFromBlob(blob: Blob): Promise<AudioBuffer> {
     reader.onload = async () => {
       try {
         const audioContext = new AudioContext();
-        const arrayBuffer = reader.result as ArrayBuffer;
-        const buffer = await audioContext.decodeAudioData(arrayBuffer);
+        const buffer = await audioContext.decodeAudioData(reader.result as ArrayBuffer);
         resolve(buffer);
       } catch (err) {
         reject(err);
